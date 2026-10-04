@@ -85,12 +85,19 @@ class RFDETRIntegrationTests(unittest.TestCase):
         model.eval()
         criterion.eval()
         with torch.no_grad():
+            inference = model(cubes)
             output = model(cubes, targets)
             losses, stats = criterion(output, targets)
         self.assertEqual(output["pred_boxes"].shape[1] * config.group_detr,
                          initial["pred_boxes"].shape[1])
-        self.assertEqual(stats["matched_rois"], 1)
+        torch.testing.assert_close(output["pred_boxes"], inference["pred_boxes"], rtol=0, atol=0)
+        torch.testing.assert_close(output["pred_logits"], inference["pred_logits"], rtol=0, atol=0)
+        torch.testing.assert_close(output["refinement"]["pairs"], inference["refinement"]["pairs"])
+        self.assertEqual(len(output["refinement"]["pairs"]), config.eval_topk)
+        self.assertIn(stats["matched_rois"], (0, 1))
         self.assertTrue(torch.isfinite(criterion.total(losses)))
+        with self.assertRaisesRegex(ValueError, r"model\(cubes, targets\)"):
+            criterion(inference, targets)
         model.train()
         criterion.train()
         with torch.no_grad():

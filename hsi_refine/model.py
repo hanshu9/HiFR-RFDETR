@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from threading import get_ident
 import torch
 from torch import nn
 
@@ -15,6 +16,8 @@ class HSIBoundaryDetector(nn.Module):
     cubes are fixed-size, unpadded Bx16xHxW tensors in [0,1]. Boxes are
     normalized cxcywh. The original classification/auxiliary/encoder outputs
     are retained. Selected final boxes are refined in one forward pass.
+    In eval mode, targets only annotate selected queries for loss computation;
+    they never change the selected queries or predictions.
     """
     def __init__(self, detector, config: ModelConfig, matcher=None, detector_input_builder=None):
         super().__init__()
@@ -45,8 +48,14 @@ class HSIBoundaryDetector(nn.Module):
 
     def _coarse_forward(self, images):
         cache = []
+        backbone = self.detector.backbone if self.refiner_enabled else None
+        caller_thread = get_ident()
 
         def capture(_module, _inputs, output):
+            # DataParallel replicas share hook registries. A callback belongs
+            # only to this replica and this forward's thread.
+            if _module is not backbone or get_ident() != caller_thread:
+                return
             features = output[0]
             feature = features[0]
             tensor = feature.tensors if hasattr(feature, "tensors") else feature
@@ -54,7 +63,7 @@ class HSIBoundaryDetector(nn.Module):
                 raise RuntimeError("Unsupported RF-DETR backbone output; expected a 4D feature tensor")
             cache.append(tensor)
 
-        handle = self.detector.backbone.register_forward_hook(capture) if self.refiner_enabled else None
+        handle = backbone.register_forward_hook(capture) if backbone is not None else None
         try:
             context = torch.no_grad() if self.config.freeze_detector else nullcontext()
             with context:
@@ -81,15 +90,22 @@ class HSIBoundaryDetector(nn.Module):
             if matches is not None:
                 q, g = matches[b]
                 q, g = q.to(scores.device), g.to(scores.device)
-                # Keep every matched positive, even when low-confidence or
-                # duplicated across Group-DETR training groups.
-                selected = torch.unique(torch.cat((selected, q)), sorted=True)
+                # Only training adds low-confidence/grouped matched positives.
+                # Evaluation preserves exactly the same TopK and order as
+                # target-free inference; matches only annotate those queries.
+                if self.training:
+                    selected = torch.unique(torch.cat((selected, q)), sorted=True)
                 gt_for_query[q] = g
             pairs.append(torch.stack((torch.full_like(selected, b), selected), dim=1))
             assignments.append(gt_for_query[selected])
         return torch.cat(pairs), torch.cat(assignments)
 
     def forward(self, cubes, targets=None):
+        if getattr(self, "_is_replica", False) and not getattr(self, "_hsi_parallel_replica", False):
+            raise RuntimeError(
+                "Use hsi_refine.HSIDataParallel instead of torch.nn.DataParallel "
+                "to split detection targets and gather refinement image indices."
+            )
         if cubes.ndim != 4 or cubes.shape[1] != self.config.input_channels:
             raise ValueError(f"Expected Bx{self.config.input_channels}xHxW cubes")
         if cubes.shape[0] < 1 or min(cubes.shape[-2:]) < 4:
@@ -104,7 +120,7 @@ class HSIBoundaryDetector(nn.Module):
             output["refinement"] = None
             return output
         if targets is not None and self.matcher is None:
-            raise ValueError("Training with targets requires the RF-DETR Hungarian matcher")
+            raise ValueError("Refinement supervision requires the RF-DETR Hungarian matcher")
         matches = None
         if targets is not None:
             group = self.config.group_detr if self.detector.training else 1
@@ -137,7 +153,11 @@ class HSIBoundaryDetector(nn.Module):
         refined_boxes = coarse["pred_boxes"].clone()
         refined_boxes[batch_indices, query_indices] = xyxy_to_cxcywh(blended).to(refined_boxes)
         output["pred_boxes"] = refined_boxes
+        # A one-element tensor stays on-device and can be concatenated by
+        # PyTorch's output gather, unlike a Python bool or a scalar tensor.
+        has_assignments = cubes.new_full((1,), matches is not None, dtype=torch.bool)
         refinement.update({"pairs": pairs, "gt_indices": gt_indices, "regions": regions,
-                           "raw_refined_xyxy": predicted, "blended_xyxy": blended})
+                           "raw_refined_xyxy": predicted, "blended_xyxy": blended,
+                           "has_target_assignments": has_assignments})
         output["refinement"] = refinement
         return output

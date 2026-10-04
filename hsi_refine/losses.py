@@ -27,8 +27,16 @@ class RefinementCriterion(nn.Module):
                                 loss_refine_giou=giou_weight)
 
     def forward(self, outputs, targets):
-        losses = self.detector_criterion(outputs["coarse_outputs"], targets)
         ref = outputs["refinement"]
+        assignments = ref.get("has_target_assignments") if ref is not None else None
+        if ref is not None and (assignments is None or not assignments.all()):
+            raise ValueError(
+                "Refinement loss requires targets in the model forward pass. "
+                "Call model(cubes, targets) before criterion(outputs, targets). "
+                "For target-free inference, use model.eval() and model(cubes) "
+                "without computing a loss."
+            )
+        losses = self.detector_criterion(outputs["coarse_outputs"], targets)
         zero = outputs["pred_boxes"].sum() * 0
         stats = {"matched_rois": 0, "supervised_rois": 0}
         if ref is None:

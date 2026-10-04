@@ -1,9 +1,11 @@
 """CPU tests for module behavior and detector interfaces."""
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.parallel.scatter_gather import gather
 
 from hsi_refine.config import ModelConfig
 from hsi_refine.model import HSIBoundaryDetector
@@ -52,6 +54,16 @@ class MatcherFixture(nn.Module):
         return result
 
 
+class RankedDetectorFixture(DetectorFixture):
+    """Keep matched queries below the inference TopK, without score ties."""
+    def forward(self, image):
+        output = super().forward(image)
+        logits = output["pred_logits"]
+        rank = torch.arange(logits.shape[1], device=logits.device, dtype=logits.dtype)
+        output["pred_logits"] = rank[None, :, None].expand_as(logits)
+        return output
+
+
 class CriterionFixture(nn.Module):
     weight_dict = {"loss_ce": 1.0, "loss_bbox": 1.0}
 
@@ -60,12 +72,13 @@ class CriterionFixture(nn.Module):
                 "loss_bbox": outputs["pred_boxes"].square().mean() * 0.01}
 
 
-def make_model(mode="combined", groups=1, frozen=False, chunk=4):
+def make_model(mode="combined", groups=1, frozen=False, chunk=4, ranked=False):
     config = ModelConfig(num_classes=3, detector_resolution=64, group_detr=groups,
                          global_channels=16, fusion_channels=8, roi_size=8,
                          boundary_bins=32, mode=mode, train_topk=2, eval_topk=4,
                          roi_chunk_size=chunk, freeze_detector=frozen)
-    return HSIBoundaryDetector(DetectorFixture(groups=groups), config, MatcherFixture())
+    detector = RankedDetectorFixture if ranked else DetectorFixture
+    return HSIBoundaryDetector(detector(groups=groups), config, MatcherFixture())
 
 
 def targets(batch=2, empty=False):
@@ -124,6 +137,102 @@ class ModelTests(unittest.TestCase):
             queries = ref["pairs"][ref["pairs"][:, 0] == b, 1].tolist()
             self.assertTrue({0, 8, 16} <= set(queries))
         self.assertEqual(int((ref["gt_indices"] >= 0).sum()), 6)
+
+    def test_eval_predictions_are_independent_of_targets(self):
+        cube = torch.rand(1, 16, 64, 128)
+        for mode in ("baseline", "highres", "locnet", "combined"):
+            for frozen in (False, True):
+                with self.subTest(mode=mode, frozen=frozen):
+                    model = make_model(mode, frozen=frozen, chunk=1, ranked=True).eval()
+                    model.config.eval_topk = 2
+                    with torch.no_grad():
+                        # A nonzero refiner ensures a changed candidate set would
+                        # change the prediction, unlike the identity initialization.
+                        if mode == "highres":
+                            model.head.net[-1].bias.fill_(0.4)
+                        elif mode != "baseline":
+                            for head in (model.head.x_head, model.head.y_head):
+                                head[-1].weight.normal_(0, 0.2)
+                        prediction = model(cube)
+                        if mode != "baseline":
+                            difference = prediction["pred_boxes"] - prediction["coarse_outputs"]["pred_boxes"]
+                            self.assertGreater(float(difference.abs().max()), 1e-6)
+                        for batch_targets in (targets(1), targets(1, empty=True)):
+                            output = model(cube, batch_targets)
+                            torch.testing.assert_close(output["pred_boxes"], prediction["pred_boxes"], rtol=0, atol=0)
+                            torch.testing.assert_close(output["pred_logits"], prediction["pred_logits"], rtol=0, atol=0)
+                            if mode != "baseline":
+                                self.assertEqual(output["refinement"]["pairs"].tolist(), [[0, 7], [0, 6]])
+                            losses, stats = RefinementCriterion(CriterionFixture()).eval()(output, batch_targets)
+                            self.assertEqual(stats["matched_rois"], 0)
+                            self.assertTrue(all(torch.isfinite(value) for value in losses.values()))
+
+    def test_eval_loss_supervises_only_matched_topk_candidates(self):
+        model = make_model(ranked=True).eval()
+        model.config.eval_topk = 2
+        batch_targets = targets(1)
+        batch_targets[0]["boxes"] = batch_targets[0]["boxes"].repeat(7, 1)
+        batch_targets[0]["labels"] = batch_targets[0]["labels"].repeat(7)
+        with torch.no_grad():
+            output = model(torch.rand(1, 16, 64, 128), batch_targets)
+            losses, stats = RefinementCriterion(CriterionFixture()).eval()(output, batch_targets)
+        # Matcher assigns queries 0..6. Only query 6 is inside TopK [7, 6].
+        self.assertEqual(output["refinement"]["pairs"].tolist(), [[0, 7], [0, 6]])
+        self.assertEqual(output["refinement"]["gt_indices"].tolist(), [-1, 6])
+        self.assertEqual(stats, {"matched_rois": 1, "supervised_rois": 1})
+        self.assertGreater(float(losses["loss_boundary"]), 0)
+
+    def test_criterion_rejects_missing_forward_targets(self):
+        cube = torch.rand(1, 16, 64, 128)
+        for mode in ("highres", "locnet", "combined"):
+            for training in (True, False):
+                with self.subTest(mode=mode, training=training):
+                    model = make_model(mode).train(training)
+                    criterion = RefinementCriterion(CriterionFixture()).train(training)
+                    output = model(cube)
+                    for empty in (False, True):
+                        with self.assertRaisesRegex(ValueError, r"model\(cubes, targets\)"):
+                            criterion(output, targets(1, empty=empty))
+
+    def test_baseline_loss_accepts_targets_only_in_criterion(self):
+        model = make_model("baseline")
+        criterion = RefinementCriterion(CriterionFixture())
+        losses, stats = criterion(model(torch.rand(1, 16, 64, 128)), targets(1))
+        self.assertTrue(torch.isfinite(criterion.total(losses)))
+        self.assertEqual(stats, {"matched_rois": 0, "supervised_rois": 0})
+
+    def test_assignment_metadata_survives_output_gather(self):
+        model = make_model().eval()
+        cube = torch.rand(1, 16, 64, 128)
+        with torch.no_grad():
+            flags = [model(cube, batch_targets)["refinement"]["has_target_assignments"]
+                     for batch_targets in (targets(1), targets(1, empty=True), None)]
+        # Exercise PyTorch's actual container recursion on CPU. Only the CUDA
+        # tensor transfer is replaced; Python bool leaves still fail here.
+        def concatenate(_device, dim, *tensors):
+            return torch.cat(tensors, dim=dim)
+        with patch("torch.nn.parallel.scatter_gather.Gather.apply", side_effect=concatenate):
+            merged = gather([{"refinement": {"has_target_assignments": flag}}
+                             for flag in flags], target_device="cpu")
+        flag = merged["refinement"]["has_target_assignments"]
+        self.assertEqual(flag.dtype, torch.bool)
+        self.assertEqual(flag.tolist(), [True, True, False])
+
+    def test_loss_checks_all_gathered_assignment_flags(self):
+        model = make_model()
+        batch_targets = targets(1)
+        output = model(torch.rand(1, 16, 64, 128), batch_targets)
+        criterion = RefinementCriterion(CriterionFixture())
+        for flags in ([True, True], [True, False], [False, True], [False, False]):
+            with self.subTest(flags=flags):
+                output["refinement"]["has_target_assignments"] = torch.tensor(flags)
+                if all(flags):
+                    losses, stats = criterion(output, batch_targets)
+                    self.assertEqual(stats["supervised_rois"], 1)
+                    self.assertTrue(torch.isfinite(criterion.total(losses)))
+                else:
+                    with self.assertRaisesRegex(ValueError, r"model\(cubes, targets\)"):
+                        criterion(output, batch_targets)
 
     def test_refinement_targets_with_mixed_counts_and_grouped_matches(self):
         model = make_model(groups=2).train()
@@ -203,7 +312,10 @@ class ModelTests(unittest.TestCase):
             self.assertFalse(model.adapter.training)
             output = model(cubes, batch_targets)
             self.assertEqual(output["pred_boxes"].shape, (1, 8, 4))
-            self.assertEqual(int((output["refinement"]["gt_indices"] >= 0).sum()), 1)
+            selected = output["refinement"]["pairs"][:, 1].tolist()
+            self.assertEqual(int((output["refinement"]["gt_indices"] >= 0).sum()), int(0 in selected))
+            if model.training:
+                self.assertIn(0, selected)
         criterion = RefinementCriterion(CriterionFixture())
         losses, _ = criterion(output, batch_targets)
         loss = criterion.total(losses)
